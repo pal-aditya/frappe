@@ -1,43 +1,58 @@
-version: "3"
-
 services:
-  backend:
-    image: aditya090/projectk8s:frappe
-#    platform: linux/amd64
+  db:
+    image: mariadb:10.6
+    networks:
+      - frappe_network
+    environment:
+      MYSQL_ROOT_PASSWORD: admin
+      MARIADB_ROOT_PASSWORD: admin
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "--password=admin"]
+      interval: 3s
+      retries: 20
+    volumes:
+      - db-data:/var/lib/mysql
+
+  redis-cache:
+    image: redis:6.2-alpine
+    networks:
+      - frappe_network
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  redis-queue:
+    image: redis:6.2-alpine
     networks:
       - frappe_network
     deploy:
       restart_policy:
         condition: on-failure
     volumes:
-      - sites:/home/frappe/frappe-bench/sites
-      - logs:/home/frappe/frappe-bench/logs
-    environment:
-      DB_HOST: db
-      DB_PORT: "3306"
-      MYSQL_ROOT_PASSWORD: admin
-      MARIADB_ROOT_PASSWORD: admin
+      - redis-queue-data:/data
 
   configurator:
     image: aditya090/projectk8s:frappe
-#    platform: linux/amd64
     networks:
       - frappe_network
-    deploy:
-      restart_policy:
-        condition: none
-    entrypoint:
-      - bash
-      - -c
-    command:
-      - >
-        ls -1 apps > sites/apps.txt;
-        bench set-config -g db_host $$DB_HOST;
-        bench set-config -gp db_port $$DB_PORT;
-        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
-        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
-        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
-        bench set-config -gp socketio_port $$SOCKETIO_PORT;
+    depends_on:
+      - db
+      - redis-cache
+      - redis-queue
+    entrypoint: ["bash", "-c"]
+    command: >
+      ls -1 apps > sites/apps.txt;
+      bench set-config -g db_host $$DB_HOST;
+      bench set-config -gp db_port $$DB_PORT;
+      bench set-config -g redis_cache "redis://$$REDIS_CACHE";
+      bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
+      bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
+      bench set-config -gp socketio_port $$SOCKETIO_PORT;
     environment:
       DB_HOST: db
       DB_PORT: "3306"
@@ -50,73 +65,48 @@ services:
 
   create-site:
     image: aditya090/projectk8s:frappe
-#    platform: linux/amd64
     networks:
       - frappe_network
-    deploy:
-      restart_policy:
-        condition: none
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
+      configurator:
+        condition: service_completed_successfully
+    entrypoint: ["bash", "-c"]
+    command: >
+      wait-for-it -t 120 db:3306;
+      wait-for-it -t 120 redis-cache:6379;
+      wait-for-it -t 120 redis-queue:6379;
+      bench new-site --mariadb-user-host-login-scope='%' --admin-password=admin --db-root-username=root --db-root-password=admin --install-app erpnext --install-app hrms --install-app india_compliance --set-default frontend;
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
-    entrypoint:
-      - bash
-      - -c
-    command:
-      - >
-        wait-for-it -t 120 db:3306;
-        wait-for-it -t 120 redis-cache:6379;
-        wait-for-it -t 120 redis-queue:6379;
-        export start=`date +%s`;
-        until [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".db_host // empty"` ]] && \
-          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_cache // empty"` ]] && \
-          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_queue // empty"` ]];
-        do
-          echo "Waiting for sites/common_site_config.json to be created";
-          sleep 5;
-          if (( `date +%s`-start > 120 )); then
-            echo "could not find sites/common_site_config.json with required keys";
-            exit 1
-          fi
-        done;
-        echo "sites/common_site_config.json found";
-        bench new-site --mariadb-user-host-login-scope='%' --admin-password=admin --db-root-username=root --db-root-password=admin --install-app erpnext --install-app hrms --install-app india_compliance --set-default frontend;
 
-  db:
-    image: mariadb:10.6
-#    platform: linux/amd64
+  backend:
+    image: aditya090/projectk8s:frappe
     networks:
       - frappe_network
-    healthcheck:
-      test: mysqladmin ping -h localhost --password=admin
-      interval: 1s
-      retries: 20
-    deploy:
-      restart_policy:
-        condition: on-failure
-    command:
-      - --character-set-server=utf8mb4
-      - --collation-server=utf8mb4_unicode_ci
-      - --skip-character-set-client-handshake
-      - --skip-innodb-read-only-compressed # Temporary fix for MariaDB 10.6
+    depends_on:
+      - create-site
     environment:
+      DB_HOST: db
+      DB_PORT: "3306"
       MYSQL_ROOT_PASSWORD: admin
       MARIADB_ROOT_PASSWORD: admin
     volumes:
-      - db-data:/var/lib/mysql
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
 
   frontend:
     image: aditya090/projectk8s:frappe
-#    platform: linux/arm64
     networks:
       - frappe_network
     depends_on:
       - websocket
-    deploy:
-      restart_policy:
-        condition: on-failure
-    command:
-      - nginx-entrypoint.sh
     environment:
       BACKEND: backend:8000
       FRAPPE_SITE_NAME_HEADER: frontend
@@ -131,87 +121,48 @@ services:
       - logs:/home/frappe/frappe-bench/logs
     ports:
       - "8084:8080"
+    command: nginx-entrypoint.sh
+
+  scheduler:
+    image: aditya090/projectk8s:frappe
+    networks:
+      - frappe_network
+    depends_on:
+      - backend
+    command: bench schedule
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
 
   queue-long:
     image: aditya090/projectk8s:frappe
-#    platform: linux/arm64
     networks:
       - frappe_network
-    deploy:
-      restart_policy:
-        condition: on-failure
-    command:
-      - bench
-      - worker
-      - --queue
-      - long,default,short
+    depends_on:
+      - backend
+    command: bench worker --queue long,default,short
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
 
   queue-short:
     image: aditya090/projectk8s:frappe
-#    platform: linux/arm64
     networks:
       - frappe_network
-    deploy:
-      restart_policy:
-        condition: on-failure
-    command:
-      - bench
-      - worker
-      - --queue
-      - short,default
-    volumes:
-      - sites:/home/frappe/frappe-bench/sites
-      - logs:/home/frappe/frappe-bench/logs
-
-  redis-queue:
-    image: redis:6.2-alpine
-    platform: linux/amd64
-    networks:
-      - frappe_network
-    deploy:
-      restart_policy:
-        condition: on-failure
-    volumes:
-      - redis-queue-data:/data
-
-  redis-cache:
-    image: redis:6.2-alpine
-    platform: linux/amd64
-    networks:
-      - frappe_network
-    deploy:
-      restart_policy:
-        condition: on-failure
-
-  scheduler:
-    image: aditya090/projectk8s:frappe
- #   platform: linux/amd64
-    networks:
-      - frappe_network
-    deploy:
-      restart_policy:
-        condition: on-failure
-    command:
-      - bench
-      - schedule
+    depends_on:
+      - backend
+    command: bench worker --queue short,default
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
 
   websocket:
     image: aditya090/projectk8s:frappe
-  #  platform: linux/amd64
     networks:
       - frappe_network
-    deploy:
-      restart_policy:
-        condition: on-failure
-    command:
-      - node
-      - /home/frappe/frappe-bench/apps/frappe/socketio.js
+    depends_on:
+      - backend
+    command: node /home/frappe/frappe-bench/apps/frappe/socketio.js
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
